@@ -1,15 +1,13 @@
 import asyncio
 import logging
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import (
     Any,
     AsyncGenerator,
     Callable,
     Coroutine,
-    Iterable,
-    Mapping,
     Optional,
     TypeVar,
     cast,
@@ -19,10 +17,11 @@ import strawberry
 from openinference.semconv.trace import SpanAttributes
 from opentelemetry.context import Context as OtelContext
 from sqlalchemy import and_, insert, select
+from sqlalchemy import func as sa_func
 from sqlalchemy.orm import load_only
 from strawberry.relay.types import GlobalID
 from strawberry.types import Info
-from typing_extensions import TypeAlias, assert_never
+from typing_extensions import TypeAlias
 
 from phoenix.config import PLAYGROUND_PROJECT_NAME
 from phoenix.datetime_utils import local_now, normalize_datetime
@@ -31,7 +30,12 @@ from phoenix.db.helpers import (
     get_dataset_example_revisions,
     insert_experiment_with_examples_snapshot,
 )
-from phoenix.db.types.prompts import PromptTemplateFormat
+from phoenix.db.types.experiment_config import (
+    EvaluatorConfig,
+    EvaluatorConfigs,
+    PromptVersionConfig,
+    TaskConfig,
+)
 from phoenix.server.api.auth import IsLocked, IsNotReadOnly, IsNotViewer
 from phoenix.server.api.context import Context
 from phoenix.server.api.evaluators import (
@@ -46,10 +50,9 @@ from phoenix.server.api.helpers.evaluators import (
     get_evaluator_output_configs,
 )
 from phoenix.server.api.helpers.message_helpers import (
-    PlaygroundMessage,
     build_template_variables,
-    create_playground_message,
     extract_and_convert_example_messages,
+    formatted_messages,
     prompt_chat_template_to_playground_messages,
 )
 from phoenix.server.api.helpers.playground_clients import (
@@ -78,7 +81,7 @@ from phoenix.server.api.types.DatasetVersion import DatasetVersion
 from phoenix.server.api.types.Experiment import to_gql_experiment
 from phoenix.server.api.types.ExperimentRun import ExperimentRun
 from phoenix.server.api.types.ExperimentRunAnnotation import ExperimentRunAnnotation
-from phoenix.server.api.types.node import from_global_id_with_expected_type
+from phoenix.server.api.types.node import from_global_id, from_global_id_with_expected_type
 from phoenix.server.api.types.Span import Span
 from phoenix.server.api.types.Trace import Trace
 from phoenix.server.daemons.span_cost_calculator import SpanCostCalculator
@@ -87,10 +90,6 @@ from phoenix.server.experiments.utils import generate_experiment_project_name
 from phoenix.server.types import DbSessionFactory
 from phoenix.tracers import Tracer
 from phoenix.utilities.template_formatters import (
-    FStringTemplateFormatter,
-    MustacheTemplateFormatter,
-    NoOpFormatter,
-    TemplateFormatter,
     TemplateFormatterError,
 )
 
@@ -115,14 +114,12 @@ async def _stream_single_chat_completion(
     on_span_insertion: Callable[[], None],
     span_cost_calculator: SpanCostCalculator,
 ) -> ChatStream:
-    messages = prompt_chat_template_to_playground_messages(input.prompt_version.template)
+    messages = prompt_chat_template_to_playground_messages(input.prompt_version.template.to_orm())
     if template_options := input.template:
-        messages = list(
-            _formatted_messages(
-                messages=messages,
-                template_format=template_options.format,
-                template_variables=template_options.variables,
-            )
+        messages = formatted_messages(
+            messages=messages,
+            template_format=template_options.format,
+            template_variables=template_options.variables,
         )
     invocation_parameters = dict(input.prompt_version.invocation_parameters)
 
@@ -390,7 +387,7 @@ class Subscription:
                 custom_provider_id=input.prompt_version.resolved_custom_provider_id(),
                 session=session,
                 decrypt=info.context.decrypt,
-                credentials=input.credentials,
+                credentials=input.credentials or (),
                 client_options=input.client_options,
             )
             dataset_evaluator_node_ids = [evaluator.id for evaluator in input.evaluators]
@@ -398,7 +395,7 @@ class Subscription:
                 dataset_evaluator_node_ids=dataset_evaluator_node_ids,
                 session=session,
                 decrypt=info.context.decrypt,
-                credentials=input.credentials,
+                credentials=input.credentials or (),
             )
             project_ids = await get_evaluator_project_ids(
                 dataset_evaluator_node_ids=dataset_evaluator_node_ids,
@@ -572,6 +569,184 @@ class Subscription:
                 not_started=not_started,
             )
 
+    @strawberry.subscription(permission_classes=[IsNotReadOnly, IsNotViewer, IsLocked])  # type: ignore
+    async def chat_completion_over_dataset_new(
+        self, info: Info[Context, None], input: ChatCompletionOverDatasetInput
+    ) -> AsyncIterator[ChatCompletionSubscriptionPayload]:
+        """
+        Run experiment in background via daemon.
+
+        Drop-in replacement for chat_completion_over_dataset with same signature.
+        Delegates actual execution to ExperimentRunner.
+        """
+        # === Validation (same as chat_completion_over_dataset) ===
+        dataset_id = from_global_id_with_expected_type(input.dataset_id, Dataset.__name__)
+        version_id = (
+            from_global_id_with_expected_type(
+                global_id=input.dataset_version_id, expected_type_name=DatasetVersion.__name__
+            )
+            if input.dataset_version_id
+            else None
+        )
+
+        async with info.context.db() as session:
+            # Validate dataset exists
+            if (
+                await session.scalar(select(models.Dataset).where(models.Dataset.id == dataset_id))
+            ) is None:
+                raise NotFound(f"Could not find dataset with ID {dataset_id}")
+
+            # Resolve version ID
+            if version_id is None:
+                if (
+                    resolved_version_id := await session.scalar(
+                        select(models.DatasetVersion.id)
+                        .where(models.DatasetVersion.dataset_id == dataset_id)
+                        .order_by(models.DatasetVersion.id.desc())
+                        .limit(1)
+                    )
+                ) is None:
+                    raise NotFound(f"No versions found for dataset with ID {dataset_id}")
+            else:
+                if (
+                    resolved_version_id := await session.scalar(
+                        select(models.DatasetVersion.id).where(
+                            and_(
+                                models.DatasetVersion.dataset_id == dataset_id,
+                                models.DatasetVersion.id == version_id,
+                            )
+                        )
+                    )
+                ) is None:
+                    raise NotFound(f"Could not find dataset version with ID {version_id}")
+
+            # Parse split IDs if provided
+            resolved_split_ids: Optional[list[int]] = None
+            if input.split_ids is not None and len(input.split_ids) > 0:
+                resolved_split_ids = [
+                    from_global_id_with_expected_type(split_id, models.DatasetSplit.__name__)
+                    for split_id in input.split_ids
+                ]
+
+            # Validate at least one example exists (don't load all - daemon will paginate)
+            example_count = await session.scalar(
+                select(sa_func.count()).select_from(
+                    get_dataset_example_revisions(
+                        resolved_version_id,
+                        split_ids=resolved_split_ids,
+                    ).subquery()
+                )
+            )
+            if not example_count:
+                raise NotFound("No examples found for the given dataset and version")
+
+            # === Create project (same as chat_completion_over_dataset) ===
+            project_name = generate_experiment_project_name()
+            if (
+                await session.scalar(
+                    select(models.Project.id).where(models.Project.name == project_name)
+                )
+            ) is None:
+                await session.scalar(
+                    insert(models.Project)
+                    .returning(models.Project.id)
+                    .values(
+                        name=project_name,
+                        description="Traces from prompt playground",
+                    )
+                )
+
+            # === Create experiment (same as chat_completion_over_dataset) ===
+            user_id = get_user(info)
+            experiment = models.Experiment(
+                dataset_id=from_global_id_with_expected_type(input.dataset_id, Dataset.__name__),
+                dataset_version_id=resolved_version_id,
+                name=input.experiment_name
+                or _default_playground_experiment_name(input.prompt_name),
+                description=input.experiment_description,
+                repetitions=input.repetitions,
+                metadata_=input.experiment_metadata or dict(),
+                project_name=project_name,
+                user_id=user_id,
+            )
+            if resolved_split_ids:
+                experiment.experiment_dataset_splits = [
+                    models.ExperimentDatasetSplit(dataset_split_id=split_id)
+                    for split_id in resolved_split_ids
+                ]
+            await insert_experiment_with_examples_snapshot(session, experiment)
+
+            # === Create execution config (NEW: freeze request) ===
+            # Resolve evaluators so we can store full output config when user provides one
+            # (mirrors regular evals)
+            evaluator_node_ids = [e.id for e in input.evaluators]
+            evaluators_list = (
+                await get_evaluators(
+                    dataset_evaluator_node_ids=evaluator_node_ids,
+                    session=session,
+                    decrypt=info.context.decrypt,
+                    credentials=input.credentials or (),
+                )
+                if evaluator_node_ids
+                else []
+            )
+
+            prompt_version: models.PromptVersion = input.prompt_version.to_orm_prompt_version()
+            prompt_version_config = PromptVersionConfig(
+                template_type=prompt_version.template_type,
+                template_format=prompt_version.template_format,
+                template=prompt_version.template,
+                model_provider=prompt_version.model_provider,
+                model_name=prompt_version.model_name,
+                invocation_parameters=prompt_version.invocation_parameters,
+                tools=prompt_version.tools,
+                response_format=prompt_version.response_format,
+                custom_provider_id=prompt_version.custom_provider_id,
+            )
+            task_config = TaskConfig(
+                prompt_version_config=prompt_version_config,
+                template_variables_path=input.template_variables_path,
+                appended_messages_path=input.appended_messages_path,
+            )
+
+            execution_config = models.ExperimentExecutionConfig(
+                id=experiment.id,
+                # claimed_at=NULL means not running; start_experiment() will claim it
+                task_config=task_config,
+                evaluator_configs=EvaluatorConfigs(
+                    evaluators=[
+                        EvaluatorConfig(
+                            dataset_evaluator_id=from_global_id(e.id)[1],  # Extract numeric ID
+                            input_mapping=e.input_mapping.to_orm(),
+                            output_configs=get_evaluator_output_configs(e, evaluators_list[idx]),
+                        )
+                        for idx, e in enumerate(input.evaluators)
+                    ]
+                ),
+            )
+            session.add(execution_config)
+
+        # === Yield experiment immediately ===
+        yield ChatCompletionSubscriptionExperiment(experiment=to_gql_experiment(experiment))
+
+        # === Register with daemon and stream results ===
+        # Pass credentials as ephemeral data (not stored in DB)
+        credentials = input.credentials or ()
+        running_exp, receive_stream = await info.context.experiment_runner.start_experiment(
+            execution_config,
+            credentials=credentials,
+            subscribe=True,
+        )
+
+        # Stream results until producer closes the stream (signals completion via EndOfStream)
+        try:
+            async for payload in receive_stream:
+                yield payload
+        finally:
+            # Close the receive stream - experiment continues in background
+            # User must explicitly cancel via mutation if they want to stop it
+            await receive_stream.aclose()
+
 
 async def _stream_chat_completion_over_dataset_example(
     *,
@@ -596,7 +771,7 @@ async def _stream_chat_completion_over_dataset_example(
         else None
     )
     db_run: Optional[models.ExperimentRun] = None
-    messages = prompt_chat_template_to_playground_messages(input.prompt_version.template)
+    messages = prompt_chat_template_to_playground_messages(input.prompt_version.template.to_orm())
     try:
         format_start_time = cast(datetime, normalize_datetime(dt=local_now(), tz=timezone.utc))
         # Build template variables using shared helper
@@ -606,12 +781,10 @@ async def _stream_chat_completion_over_dataset_example(
             metadata=revision.metadata_,
             template_variables_path=input.template_variables_path,
         )
-        messages = list(
-            _formatted_messages(
-                messages=messages,
-                template_format=input.prompt_version.template_format,
-                template_variables=template_variables,
-            )
+        messages = formatted_messages(
+            messages=messages,
+            template_format=input.prompt_version.template_format,
+            template_variables=template_variables,
         )
         # Append messages from dataset example if path is specified
         if input.appended_messages_path:
@@ -806,46 +979,6 @@ async def _wait_for(
 
 async def _as_coroutine(iterable: AsyncIterator[GenericType]) -> GenericType:
     return await iterable.__anext__()
-
-
-def _formatted_messages(
-    *,
-    messages: Iterable[PlaygroundMessage],
-    template_format: PromptTemplateFormat,
-    template_variables: Mapping[str, Any],
-) -> Iterator[PlaygroundMessage]:
-    """
-    Formats the messages using the given template options.
-    """
-    messages_list = list(messages)
-    if not messages_list:
-        return iter([])
-    template_formatter = _template_formatter(template_format=template_format)
-    result: list[PlaygroundMessage] = []
-    for msg in messages_list:
-        formatted_content = template_formatter.format(msg["content"], **template_variables)
-        result.append(
-            create_playground_message(
-                msg["role"],
-                formatted_content,
-                msg.get("tool_call_id"),
-                msg.get("tool_calls"),
-            )
-        )
-    return iter(result)
-
-
-def _template_formatter(template_format: PromptTemplateFormat) -> TemplateFormatter:
-    """
-    Instantiates the appropriate template formatter for the template format
-    """
-    if template_format is PromptTemplateFormat.MUSTACHE:
-        return MustacheTemplateFormatter()
-    if template_format is PromptTemplateFormat.F_STRING:
-        return FStringTemplateFormatter()
-    if template_format is PromptTemplateFormat.NONE:
-        return NoOpFormatter()
-    assert_never(template_format)
 
 
 def _default_playground_experiment_name(prompt_name: Optional[str] = None) -> str:

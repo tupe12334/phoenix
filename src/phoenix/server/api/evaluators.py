@@ -184,6 +184,10 @@ class LLMEvaluator(BaseEvaluator):
         return self._output_configs
 
     @property
+    def llm_client(self) -> "PlaygroundStreamingClient[Any]":
+        return self._llm_client
+
+    @property
     def input_schema(self) -> dict[str, Any]:
         formatter = get_template_formatter(self._template_format)
         section_vars: set[str] = set()
@@ -622,7 +626,7 @@ async def _get_llm_evaluators(
     evaluator_node_ids: list[GlobalID],
     session: AsyncSession,
     decrypt: Callable[[bytes], bytes],
-    credentials: list[GenerativeCredentialInput] | None = None,
+    credentials: Sequence[GenerativeCredentialInput] | None = None,
 ) -> list[LLMEvaluator]:
     """
     Get LLM evaluators for the given node IDs.
@@ -733,7 +737,7 @@ async def get_evaluators(
     dataset_evaluator_node_ids: list[GlobalID],
     session: AsyncSession,
     decrypt: Callable[[bytes], bytes],
-    credentials: list[GenerativeCredentialInput] | None = None,
+    credentials: Sequence[GenerativeCredentialInput] | None = None,
 ) -> list[BaseEvaluator]:
     """
     Get all evaluators for the given DatasetEvaluator node IDs.

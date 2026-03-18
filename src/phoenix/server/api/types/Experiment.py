@@ -35,6 +35,7 @@ from phoenix.server.api.types.SpanCostSummary import SpanCostSummary
 _DEFAULT_EXPERIMENT_RUNS_PAGE_SIZE = 50
 
 if TYPE_CHECKING:
+    from .ExperimentJob import ExperimentJob
     from .Project import Project
     from .User import User
 
@@ -375,6 +376,18 @@ class Experiment(Node):
         return connection_from_list(
             [DatasetSplit(id=split.id, db_record=split) for split in splits], ConnectionArgs()
         )
+
+    @strawberry.field
+    async def background_job(
+        self, info: Info[Context, None]
+    ) -> Annotated["ExperimentJob", strawberry.lazy(".ExperimentJob")] | None:
+        async with info.context.db() as session:
+            job = await session.get(models.ExperimentExecutionConfig, self.id)
+        if job is None:
+            return None
+        from .ExperimentJob import ExperimentJob
+
+        return ExperimentJob(id=job.id, db_record=job)
 
 
 def to_gql_experiment(

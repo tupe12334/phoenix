@@ -195,10 +195,15 @@ class ContentPartInput:
                 ),
             )
         if self.tool_result:
+            result_str = cast(str, self.tool_result.result)
+            try:
+                tool_result_value: Any = json.loads(result_str)
+            except json.JSONDecodeError:
+                tool_result_value = result_str
             return ToolResultContentPart(
                 type="tool_result",
                 tool_call_id=self.tool_result.tool_call_id,
-                tool_result=json.loads(cast(str, self.tool_result.result)),
+                tool_result=tool_result_value,
             )
         raise BadRequest("ContentPartInput: no field is set")
 
@@ -259,7 +264,7 @@ class ChatPromptVersionInput:
 
     def to_orm_prompt_version(
         self,
-        user_id: Optional[int],
+        user_id: int | None = None,
     ) -> models.PromptVersion:
         model_provider = self.model_provider.to_model_provider()
 

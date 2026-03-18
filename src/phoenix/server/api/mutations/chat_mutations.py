@@ -44,8 +44,8 @@ from phoenix.server.api.helpers.evaluators import (
 from phoenix.server.api.helpers.message_helpers import (
     PlaygroundMessage,
     build_template_variables,
-    create_playground_message,
     extract_and_convert_example_messages,
+    formatted_messages,
     prompt_chat_template_to_playground_messages,
 )
 from phoenix.server.api.helpers.playground_clients import (
@@ -54,7 +54,6 @@ from phoenix.server.api.helpers.playground_clients import (
     initialize_playground_clients,
 )
 from phoenix.server.api.helpers.playground_users import get_user
-from phoenix.server.api.helpers.prompts.template_helpers import get_template_formatter
 from phoenix.server.api.input_types.ChatCompletionInput import (
     ChatCompletionInput,
     ChatCompletionOverDatasetInput,
@@ -690,9 +689,15 @@ class ChatCompletionMutationMixin:
         project_description: str = "Traces from prompt playground",
         appended_messages: Optional[list[PlaygroundMessage]] = None,
     ) -> tuple[ChatCompletionRepetition, models.Span]:
-        messages = prompt_chat_template_to_playground_messages(input.prompt_version.template)
+        messages = prompt_chat_template_to_playground_messages(
+            input.prompt_version.template.to_orm(),
+        )
         if template_options := input.template:
-            messages = list(_formatted_messages(messages, template_options))
+            messages = formatted_messages(
+                messages=messages,
+                template_format=template_options.format,
+                template_variables=template_options.variables,
+            )
 
         # Append messages from dataset example if provided
         if appended_messages:
@@ -779,31 +784,6 @@ class ChatCompletionMutationMixin:
                 evaluations=[],
             )
         return repetition, db_span
-
-
-def _formatted_messages(
-    messages: Iterable[PlaygroundMessage],
-    template_options: PromptTemplateOptions,
-) -> Iterator[PlaygroundMessage]:
-    """
-    Formats the messages using the given template options.
-    """
-    messages_list = list(messages)
-    if not messages_list:
-        return iter([])
-    template_formatter = get_template_formatter(template_format=template_options.format)
-    result: list[PlaygroundMessage] = []
-    for msg in messages_list:
-        formatted_content = template_formatter.format(msg["content"], **template_options.variables)
-        result.append(
-            create_playground_message(
-                msg["role"],
-                formatted_content,
-                msg.get("tool_call_id"),
-                msg.get("tool_calls"),
-            )
-        )
-    return iter(result)
 
 
 _AnyT = TypeVar("_AnyT")

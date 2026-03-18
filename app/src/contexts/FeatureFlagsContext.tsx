@@ -11,7 +11,7 @@ import {
   DialogTitleExtra,
 } from "@phoenix/components/core/dialog";
 
-type FeatureFlag = "agents" | "tracing-onboarding";
+type FeatureFlag = "agents" | "tracing-onboarding" | "backgroundExperiments";
 export type FeatureFlagsContextType = {
   featureFlags: Record<FeatureFlag, boolean>;
   setFeatureFlags: (featureFlags: Record<FeatureFlag, boolean>) => void;
@@ -22,6 +22,7 @@ export const LOCAL_STORAGE_FEATURE_FLAGS_KEY = "arize-phoenix-feature-flags";
 const DEFAULT_FEATURE_FLAGS: Record<FeatureFlag, boolean> = {
   agents: false,
   "tracing-onboarding": false,
+  backgroundExperiments: false,
 };
 
 function getFeatureFlags(): Record<FeatureFlag, boolean> {
