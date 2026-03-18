@@ -65,7 +65,7 @@ from phoenix.db.types.prompts import (
     PromptResponseFormat,
     PromptTools,
 )
-from phoenix.evals.models.rate_limiters import (
+from phoenix.evals.rate_limiters import (
     RateLimiter,
 )
 from phoenix.server.api.exceptions import BadRequest, NotFound
