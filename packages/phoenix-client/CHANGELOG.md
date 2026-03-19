@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.2.0](https://github.com/Arize-ai/phoenix/compare/arize-phoenix-client-v2.1.0...arize-phoenix-client-v2.2.0) (2026-03-19)
+
+
+### Features
+
+* **client:** add get_traces method to Python and TypeScript clients ([#12245](https://github.com/Arize-ai/phoenix/issues/12245)) ([7d3f4ac](https://github.com/Arize-ai/phoenix/commit/7d3f4aca8d5bc3e6df3e5a4f69332fa8ffcc274d))
+
+
+### Documentation
+
+* **evals:** deprecate evals 1.0 docs ([#12123](https://github.com/Arize-ai/phoenix/issues/12123)) ([b0dc90f](https://github.com/Arize-ai/phoenix/commit/b0dc90f445a25ba74ddc86e0cc8bcdf721260344))
+
 ## [2.1.0](https://github.com/Arize-ai/phoenix/compare/arize-phoenix-client-v2.0.1...arize-phoenix-client-v2.1.0) (2026-03-18)
 
 
